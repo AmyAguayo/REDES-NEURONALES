@@ -1,0 +1,232 @@
+# yeast_pytorch_modified.py
+import os
+import random
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+
+
+
+# ---------------------------
+# Reproducibilidad
+# ---------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------
+# 1. Cargar datos
+# ---------------------------
+ruta = r"C:\Users\amyag\OneDrive\Documentos\UX\Semestre 5\Redes neuronales\yeast\yeast.data"
+datos = pd.read_csv(ruta, sep=r"\s+", header=None)
+
+nombres_columnas = [
+    "sequence_name",
+    "mcg", "gvh", "alm", "mit", "erl", "pox", "vac",
+    "nuc", "class"
+]
+datos.columns = nombres_columnas
+datos = datos.drop(columns=["sequence_name"])
+
+X = datos.drop("class", axis=1).values
+y = datos["class"].values
+
+# codificar etiquetas
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+NUM_CLASSES = len(le.classes_)
+
+# escalado
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# ---------------------------
+# 2. Splits (estratificado)
+# ---------------------------
+X_temp, X_test, y_temp, y_test = train_test_split(
+    X_scaled, y_encoded, test_size=0.15, random_state=SEED, stratify=y_encoded
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_temp, y_temp, test_size=0.1764705882,
+    random_state=SEED, stratify=y_temp
+)
+
+# convertir a tensores
+X_train_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
+y_train_t = torch.tensor(y_train, dtype=torch.long).to(DEVICE)
+X_val_t = torch.tensor(X_val, dtype=torch.float32).to(DEVICE)
+y_val_t = torch.tensor(y_val, dtype=torch.long).to(DEVICE)
+X_test_t = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+y_test_t = torch.tensor(y_test, dtype=torch.long).to(DEVICE)
+
+batch_size = 32
+train_ds = TensorDataset(X_train_t, y_train_t)
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+# ---------------------------
+# 3. Modelo
+# ---------------------------
+class YeastNet(nn.Module):
+    def __init__(self, input_dim=8, num_classes=10, hidden=[128, 96, 64], p_drop=0.25):
+        super().__init__()
+        layers = []
+        in_dim = input_dim
+        for h in hidden:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(p_drop))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.net = nn.Sequential(*layers)
+
+        # inicialización Xavier
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        return self.net(x)
+
+modelo = YeastNet(input_dim=8, num_classes=NUM_CLASSES, hidden=[128, 96, 64], p_drop=0.25).to(DEVICE)
+
+# ---------------------------
+# 4. Loss con pesos
+# ---------------------------
+class_counts = np.bincount(y_train)
+class_weights = 1.0 / (class_counts + 1e-8)
+class_weights = class_weights / class_weights.sum() * NUM_CLASSES
+class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights_t)
+
+# ---------------------------
+# 5. Optimizador y scheduler
+# ---------------------------
+optimizer = optim.Adam(modelo.parameters(), lr=1e-3, weight_decay=1e-5)
+
+# ❗ Aquí quitamos verbose=True (ya no existe en tu versión)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=6
+)
+
+# ---------------------------
+# 6. Entrenamiento
+# ---------------------------
+num_epochs = 200
+patience = 20
+best_val_loss = float("inf")
+no_improve = 0
+history = {"train_loss": [], "val_loss": [], "val_acc": []}
+mejor_modelo_path = "mejor_modelo_yeast.pt"
+
+for ep in range(1, num_epochs+1):
+    modelo.train()
+    running_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = modelo(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * X_batch.size(0)
+
+    train_loss = running_loss / len(train_loader.dataset)
+
+    modelo.eval()
+    with torch.no_grad():
+        val_logits = modelo(X_val_t)
+        val_loss = criterion(val_logits, y_val_t).item()
+        val_preds = torch.argmax(val_logits, dim=1).cpu().numpy()
+        val_acc = accuracy_score(y_val, val_preds)
+
+    history["train_loss"].append(train_loss)
+    history["val_loss"].append(val_loss)
+    history["val_acc"].append(val_acc)
+
+    print(f"Ep {ep:03d} | Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f} | Val acc: {val_acc:.4f}")
+
+    scheduler.step(val_loss)
+
+    if val_loss < best_val_loss - 1e-6:
+        best_val_loss = val_loss
+        no_improve = 0
+        torch.save({
+            "model_state": modelo.state_dict(),
+            "scaler": scaler,
+            "label_encoder_classes": le.classes_,
+            "class_weights": class_weights
+        }, mejor_modelo_path)
+        print("  -> Mejor modelo guardado.")
+    else:
+        no_improve += 1
+        if no_improve >= patience:
+            print("Deteniendo por early stopping.")
+            break
+
+# ---------------------------
+# 7. Evaluación final
+# ---------------------------
+checkpoint = torch.load(mejor_modelo_path, map_location=DEVICE, weights_only=False)
+modelo.load_state_dict(checkpoint["model_state"])
+modelo.eval()
+with torch.no_grad():
+    logits_test = modelo(X_test_t)
+    preds_test = torch.argmax(logits_test, dim=1).cpu().numpy()
+    test_acc = accuracy_score(y_test, preds_test)
+
+print("\n==== Resultado final en TEST ====")
+print(f"Accuracy test: {test_acc:.4f}\n")
+print("Reporte de clasificación (test):")
+print(classification_report(y_test, preds_test, target_names=le.classes_))
+
+cm = confusion_matrix(y_test, preds_test)
+print("Matriz de confusión (filas=true, columnas=pred):")
+print(cm)
+
+print(f"\nModelo guardado en: {os.path.abspath(mejor_modelo_path)}")
+
+# ---------------------------
+print("\n====================================")
+print(f"Exactitud final del modelo: {test_acc:.4f}")
+print("====================================\n")
+# ---------------------------
+
+# ---------------------------
+# 9. Gráficas de entrenamiento
+# ----- Gráfica de pérdida -----
+plt.figure(figsize=(8, 5))
+plt.plot(history["train_loss"], label="Pérdida entrenamiento")
+plt.plot(history["val_loss"], label="Pérdida validación")
+plt.title("Pérdida durante el entrenamiento")
+plt.xlabel("Época")
+plt.ylabel("Pérdida")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ----- Gráfica de exactitud -----
+plt.figure(figsize=(8, 5))
+plt.plot(history["val_acc"], label="Exactitud de validación", color="green")
+plt.title("Exactitud durante el entrenamiento")
+plt.xlabel("Época")
+plt.ylabel("Exactitud")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
